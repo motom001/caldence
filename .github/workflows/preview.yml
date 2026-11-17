@@ -1,0 +1,191 @@
+name: Preview
+
+# Fork only (motom001/caldence): every push goes live on the own webspace at once, without approval.
+#
+#   main      -> https://caldence.meissner.me/
+#   <branch>  -> https://caldence.meissner.me/<branch>/   (lower case, "/" and other characters -> "-")
+#
+# Deleting a branch (for example after the merge) removes its folder again.
+#
+# Split like upstream's deploy.yml: the build job runs npm but sees no secret; the deploy job sees
+# the FTP secrets but runs no npm and checks out nothing, it only uploads the built folder.
+#
+# Settings → Secrets and variables → Actions:
+#   Secrets:   DEPLOY_HOST, DEPLOY_USER, DEPLOY_PASSWORD
+#              DEPLOY_KNOWN_HOSTS (optional, only for sftp: the line from `ssh-keyscan <host>`)
+#   Variables: DEPLOY_PROTOCOL  ftps (default, explicit FTP over TLS) or sftp
+#              PREVIEW_SITE     (optional, default https://caldence.meissner.me/)
+# The FTP user's home folder is the web folder of the subdomain.
+
+on:
+  push:
+    branches: ['**', '!dependabot/**', '!release/**']
+  delete:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: preview-${{ github.event_name == 'delete' && github.event.ref || github.ref_name }}
+  cancel-in-progress: ${{ github.event_name != 'delete' }}
+
+env:
+  SITE: ${{ vars.PREVIEW_SITE || 'https://caldence.meissner.me/' }}
+
+jobs:
+  target:
+    if: github.event_name != 'delete' || github.event.ref_type == 'branch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      dir: ${{ steps.slug.outputs.dir }}
+      url: ${{ steps.slug.outputs.url }}
+    steps:
+      - name: Folder and address for the branch
+        id: slug
+        env:
+          BRANCH: ${{ github.event_name == 'delete' && github.event.ref || github.ref_name }}
+        run: |
+          if [ "$BRANCH" = main ]; then
+            echo "dir=." >> "$GITHUB_OUTPUT"
+            echo "url=$SITE" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          slug=$(printf '%s' "$BRANCH" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/-/g; s/-+/-/g; s/^[-.]+//; s/-+$//')
+          # Folders and files of the app itself at the root of the site.
+          case "$slug" in
+            ''|assets|icons|index.html|404.html|sw.js|robots.txt|sitemap.xml)
+              echo "::error::Branch \"$BRANCH\" gives the folder \"$slug\", which the app at the root uses. Rename the branch."
+              exit 1 ;;
+          esac
+          echo "dir=$slug" >> "$GITHUB_OUTPUT"
+          echo "url=$SITE$slug/" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: target
+    if: github.event_name != 'delete'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+      # No dependency needs an install script.
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+      - name: Add the site metadata for this address
+        env:
+          URL: ${{ needs.target.outputs.url }}
+        run: |
+          node scripts/site-meta.mjs dist "$URL"
+          # A test copy: search engines should index caldence.de, not this.
+          printf 'User-agent: *\nDisallow: /\n' > dist/robots.txt
+          rm -f dist/sitemap.xml
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: site
+          path: dist/
+          include-hidden-files: true
+          retention-days: 1
+
+  deploy:
+    needs: [target, build]
+    if: github.event_name != 'delete'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: preview
+      url: ${{ needs.target.outputs.url }}
+    permissions: {}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: site
+          path: site
+      - name: Install lftp
+        run: sudo apt-get install -y -qq lftp >/dev/null
+      - name: Upload
+        env:
+          DIR: ${{ needs.target.outputs.dir }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          LFTP_PASSWORD: ${{ secrets.DEPLOY_PASSWORD }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          DEPLOY_PROTOCOL: ${{ vars.DEPLOY_PROTOCOL || 'ftps' }}
+        run: |
+          if [ -z "$DEPLOY_HOST" ] || [ -z "$DEPLOY_USER" ] || [ -z "$LFTP_PASSWORD" ]; then
+            echo "::error::Secrets DEPLOY_HOST, DEPLOY_USER or DEPLOY_PASSWORD are missing (Settings → Secrets and variables → Actions)."
+            exit 1
+          fi
+          case "$DEPLOY_PROTOCOL" in
+            ftps) open_cmd="set ftp:ssl-force true; set ftp:ssl-protect-data true; set ssl:verify-certificate true; open --env-password -u \"$DEPLOY_USER\" ftp://$DEPLOY_HOST" ;;
+            sftp)
+              hosts="$(mktemp)"
+              if [ -n "$DEPLOY_KNOWN_HOSTS" ]; then
+                printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$hosts"; check=yes
+              else
+                echo "::warning::DEPLOY_KNOWN_HOSTS is not set: the host key is accepted without check."; check=accept-new
+              fi
+              open_cmd="set sftp:connect-program \"ssh -a -x -o StrictHostKeyChecking=$check -o UserKnownHostsFile=$hosts\"; open --env-password -u \"$DEPLOY_USER\" sftp://$DEPLOY_HOST" ;;
+            *) echo "::error::DEPLOY_PROTOCOL must be ftps or sftp, not \"$DEPLOY_PROTOCOL\"."; exit 1 ;;
+          esac
+          entry='-x ^index\.html$ -x ^sw\.js$ -x ^manifest\.webmanifest$'
+          if [ "$DIR" = . ]; then
+            # main lives at the root next to the branch folders: never delete at the top level,
+            # only inside the app's own folders.
+            final='mirror -R --no-perms --delete site/assets assets
+          mirror -R --no-perms --delete site/icons icons'
+            top="mirror -R --no-perms --no-recursion $entry site ."
+          else
+            final="mirror -R --no-perms --delete site $DIR"
+            top="mirror -R --no-perms $entry site $DIR"
+          fi
+          # New files first, the entry points after them, then the old files go: a browser never
+          # gets an index.html that points at missing assets.
+          lftp -e "set cmd:fail-exit yes; set net:max-retries 2; set net:reconnect-interval-base 5; set net:timeout 30; $open_cmd
+          mkdir -p -f $DIR
+          mirror -R --no-perms site/assets $DIR/assets
+          mirror -R --no-perms site/icons $DIR/icons
+          $top
+          mput -O $DIR site/index.html site/sw.js site/manifest.webmanifest
+          $final
+          bye"
+          echo "Online: ${{ needs.target.outputs.url }}" >> "$GITHUB_STEP_SUMMARY"
+
+  remove:
+    needs: target
+    if: github.event_name == 'delete' && needs.target.outputs.dir != '.'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: preview
+    permissions: {}
+    steps:
+      - name: Install lftp
+        run: sudo apt-get install -y -qq lftp >/dev/null
+      - name: Delete the branch folder
+        env:
+          DIR: ${{ needs.target.outputs.dir }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          LFTP_PASSWORD: ${{ secrets.DEPLOY_PASSWORD }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          DEPLOY_PROTOCOL: ${{ vars.DEPLOY_PROTOCOL || 'ftps' }}
+        run: |
+          case "$DEPLOY_PROTOCOL" in
+            ftps) open_cmd="set ftp:ssl-force true; set ftp:ssl-protect-data true; set ssl:verify-certificate true; open --env-password -u \"$DEPLOY_USER\" ftp://$DEPLOY_HOST" ;;
+            sftp)
+              hosts="$(mktemp)"
+              if [ -n "$DEPLOY_KNOWN_HOSTS" ]; then printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$hosts"; check=yes; else check=accept-new; fi
+              open_cmd="set sftp:connect-program \"ssh -a -x -o StrictHostKeyChecking=$check -o UserKnownHostsFile=$hosts\"; open --env-password -u \"$DEPLOY_USER\" sftp://$DEPLOY_HOST" ;;
+            *) echo "::error::DEPLOY_PROTOCOL must be ftps or sftp."; exit 1 ;;
+          esac
+          lftp -e "set cmd:fail-exit yes; set net:max-retries 2; set net:reconnect-interval-base 5; set net:timeout 30; $open_cmd
+          rm -r -f $DIR
+          bye"
+          echo "Removed: $SITE$DIR/" >> "$GITHUB_STEP_SUMMARY"
